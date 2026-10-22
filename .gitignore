@@ -1,0 +1,9 @@
+__pycache__/
+.pytest_cache/
+.workbuddy/
+test_assets/
+*.log
+*.log.1
+*.pyc
+retry.log
+retry.log.1
