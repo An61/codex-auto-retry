@@ -11,9 +11,28 @@ rem  the top-left screen corner (failsafe).
 rem  NOTE: keep this file ASCII-only with CRLF line endings,
 rem  otherwise cmd.exe misparses it.
 rem ============================================================
+setlocal
+if exist "%~dp0codex_retry.local.bat" call "%~dp0codex_retry.local.bat"
+
+if defined CODEX_AUTO_RETRY_PYTHON (
+    "%CODEX_AUTO_RETRY_PYTHON%" "%~dp0retry_watcher.py" --trigger "at capacity" %*
+    set "EXIT_CODE=%ERRORLEVEL%"
+    goto finish
+)
+
 where py >nul 2>&1
 if %errorlevel%==0 (
     py -3 "%~dp0retry_watcher.py" --trigger "at capacity" %*
-    exit /b %errorlevel%
+    set "EXIT_CODE=%ERRORLEVEL%"
+    goto finish
 )
 python "%~dp0retry_watcher.py" --trigger "at capacity" %*
+set "EXIT_CODE=%ERRORLEVEL%"
+
+:finish
+if not "%EXIT_CODE%"=="0" (
+    echo.
+    echo codex-auto-retry exited with code %EXIT_CODE%.
+    pause
+)
+endlocal & exit /b %EXIT_CODE%

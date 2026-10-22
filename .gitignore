@@ -1,6 +1,7 @@
 __pycache__/
 .pytest_cache/
 .workbuddy/
+codex_retry.local.bat
 test_assets/
 *.log
 *.log.1

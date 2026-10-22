@@ -38,6 +38,17 @@ For the bundled Windows launcher:
 codex_retry.bat
 ```
 
+If Python is installed in a custom environment, create a local
+`codex_retry.local.bat` next to the launcher. This file is ignored by Git:
+
+```bat
+@echo off
+set "CODEX_AUTO_RETRY_PYTHON=C:\path\to\python.exe"
+```
+
+The launcher uses this override when present, then falls back to `py -3` or
+`python`. If startup fails, the window stays open and shows the Python error.
+
 For a safe detection-only run:
 
 ```powershell
