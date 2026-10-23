@@ -44,9 +44,10 @@ codex_retry.bat
 ```
 
 The launcher splits the current screen into two equal vertical regions. To
-monitor one full-screen Codex window instead, pass `--windows 1`. For custom
-window positions, pass `--window-region x,y,w,h` once per window; this replaces
-the automatic split.
+monitor one full-screen Codex window instead, pass `--windows 1`. The legacy
+`--region x,y,w,h` option always monitors one explicit region. For custom
+multiple window positions, pass `--window-region x,y,w,h` once per window; this
+replaces the automatic split.
 
 If Python is installed in a custom environment, create a local
 `codex_retry.local.bat` next to the launcher. This file is ignored by Git:

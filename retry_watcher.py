@@ -505,6 +505,8 @@ def locate_stable_template(
     while time.monotonic() <= deadline:
         try:
             shot = pyautogui.screenshot(region=region)
+        except pyautogui.FailSafeException:
+            raise
         except Exception as exc:
             log(f"播放按钮截图失败: {exc}")
             return None
@@ -613,6 +615,31 @@ def locate_template_in_image(
     }
 
 
+def move_pointer_away(target, region=None):
+    """Move to the corner farthest from the clicked control in its region."""
+    screen_w, screen_h = pyautogui.size()
+    if region:
+        x, y, width, height = region
+    else:
+        x, y, width, height = 0, 0, screen_w, screen_h
+    margin = 20
+    corners = (
+        (x + margin, y + margin),
+        (x + max(margin, width - margin), y + margin),
+        (x + margin, y + max(margin, height - margin)),
+        (x + max(margin, width - margin), y + max(margin, height - margin)),
+    )
+    safe_x, safe_y = max(
+        corners,
+        key=lambda point: (point[0] - target["x"]) ** 2 + (point[1] - target["y"]) ** 2,
+    )
+    pyautogui.moveTo(
+        min(max(1, safe_x), max(1, screen_w - 1)),
+        min(max(1, safe_y), max(1, screen_h - 1)),
+        duration=0,
+    )
+
+
 def click_play_button(
     template,
     confidence,
@@ -642,10 +669,7 @@ def click_play_button(
         return None
     if not dry_run:
         pyautogui.click(target["x"], target["y"])
-        # Keep the pointer away from the control so hover/cursor rendering
-        # cannot obscure a later screenshot or leave the button highlighted.
-        screen_w, screen_h = pyautogui.size()
-        pyautogui.moveTo(max(1, screen_w - 20), max(1, screen_h - 20), duration=0)
+        move_pointer_away(target, region)
     return target
 
 
@@ -828,8 +852,7 @@ def monitor_region(region, args, triggers, trigger_norms, window_index, stop_eve
             try:
                 if not args.dry_run:
                     pyautogui.click(retry_click_target["x"], retry_click_target["y"])
-                    screen_w, screen_h = pyautogui.size()
-                    pyautogui.moveTo(max(1, screen_w - 20), max(1, screen_h - 20), duration=0)
+                    move_pointer_away(retry_click_target, region)
             except pyautogui.FailSafeException:
                 wlog("重试按钮触发 failsafe, 已停止所有窗口监控")
                 stop_event.set()
@@ -868,7 +891,7 @@ def main() -> None:
     ap.add_argument("--window-region", dest="window_regions", type=parse_region,
                     action="append", help="指定一个窗口区域; 可重复传入多个")
     ap.add_argument("--windows", type=int, default=1,
-                    help="自动把屏幕或 --region 左右分成几个窗口区域, 默认 1")
+                    help="没有显式区域时把屏幕左右分成几个窗口区域, 默认 1")
     ap.add_argument("--trigger", default=DEFAULT_TRIGGER, help="触发提示文字, 逗号分隔多个")
     ap.add_argument("--button", default=DEFAULT_BUTTON, help=argparse.SUPPRESS)
     ap.add_argument("--no-msg-check", action="store_true", help=argparse.SUPPRESS)
@@ -922,7 +945,12 @@ def main() -> None:
     if args.no_restore:
         log("忽略 --no-restore: 当前模式必须监控播放按钮")
 
-    regions = args.window_regions or split_monitor_regions(args.region, args.windows)
+    if args.window_regions:
+        regions = args.window_regions
+    elif args.region is not None:
+        regions = [args.region]
+    else:
+        regions = split_monitor_regions(None, args.windows)
     log(
         f"持续监控启动 | 窗口数: {len(regions)} | 区域: {regions} | 间隔: {args.interval}s | "
         "播放按钮=暂停状态时点击, 暂停按钮=运行中时不点击"
