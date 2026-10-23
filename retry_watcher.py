@@ -28,7 +28,8 @@ Codex 场景 (已适配, 也可直接双击 codex_retry.bat):
     * 按钮切换为暂停按钮(运行中)时不会点击;
     * 终端里这句英文会被软换行拆成两行, 触发词支持跨行拼接匹配。
 
-旧版 OCR 按钮定位函数仍保留作离线自检和兼容代码，但主流程不再点击"重试"。
+容量提示出现后，主流程优先点击播放按钮；如果当前未识别到播放按钮，
+但 OCR 在容量提示同一行找到“重试”，则点击该重试按钮作为备用动作。
 
 恢复目标模板:
     默认使用脚本目录下的 restore_target.png。模板是播放图标圆形按钮
@@ -291,6 +292,64 @@ def choose_button(btn_hits, msg_hits, side="right"):
         return best
 
     return max(btn_hits, key=score)
+
+
+def choose_retry_button(detections, msg_hits, button=DEFAULT_BUTTON,
+                        min_score=0.5, side="right"):
+    """Choose a retry text hit only when it is anchored to the capacity message.
+
+    Requiring a message anchor prevents an unrelated ``重试`` elsewhere in the
+    desktop from becoming a click target.  The caller may refine a merged OCR
+    box with :func:`refine_button` before clicking.
+    """
+    if not msg_hits:
+        return None
+    button_hits = find_hits(detections, [button], min_score)
+    return choose_button(button_hits, msg_hits, side) if button_hits else None
+
+
+def locate_retry_button(ocr, img, detections, msg_hits, button=DEFAULT_BUTTON,
+                        min_score=0.5, region=None, side="right"):
+    """Locate a retry text button near the capacity message.
+
+    Returns a screen-coordinate target or ``None``.  If OCR merged the full
+    sentence and button into one box, crop and re-run OCR on the expected side
+    so the click lands on the button label instead of the sentence center.
+    """
+    hit = choose_retry_button(detections, msg_hits, button, min_score, side)
+    if hit is None:
+        return None
+    kw_norms = [norm(button)]
+    point = (hit["x"], hit["y"])
+    if len(norm(str(hit.get("text", "")))) > len(kw_norms[0]) + 2:
+        refined = refine_button(ocr, img, hit, kw_norms, min_score, side)
+        if refined is not None:
+            point = refined
+    ox = region[0] if region else 0
+    oy = region[1] if region else 0
+    return {
+        "x": point[0] + ox,
+        "y": point[1] + oy,
+        "text": hit.get("text", ""),
+        "score": hit.get("score", 0.0),
+    }
+
+
+def update_stable_retry_target(previous, stable_count, current,
+                               stable_frames=2, stable_distance=45.0):
+    """Return updated retry state and a target only after stable confirmation."""
+    if current is None:
+        return None, 0, None
+    if previous is None:
+        count = 1
+    else:
+        distance = (
+            (current["x"] - previous["x"]) ** 2
+            + (current["y"] - previous["y"]) ** 2
+        ) ** 0.5
+        count = stable_count + 1 if distance <= stable_distance else 1
+    target = current if count >= max(1, stable_frames) else None
+    return current, count, target
 
 
 def visual_button_center(img, msg_hits, side="right"):
@@ -653,13 +712,15 @@ def main() -> None:
         f"OCR 就绪 | 容量提示: {triggers} | 播放模板: {args.restore_template} "
         f"| 暂停负模板: {args.pause_template}"
     )
-    log(f"持续监控中... 间隔 {args.interval}s | 播放按钮=暂停状态时点击, 暂停按钮=运行中时不点击 | 停止: 鼠标甩左上角或 Ctrl+C")
+    log(f"持续监控中... 间隔 {args.interval}s | 播放按钮=暂停状态时点击, 暂停按钮=运行中时不点击 | 无播放按钮但有容量提示旁重试按钮时点击重试 | 停止: 鼠标甩左上角或 Ctrl+C")
     if args.dry_run:
         log("*** dry-run 模式: 只报告, 不点击 ***")
 
     clicks = 0
     capacity_seen = False
     last_click_time = 0.0
+    previous_retry_target = None
+    retry_stable_count = 0
     scan_count = 0
     last_heartbeat = time.monotonic()
     try:
@@ -691,6 +752,31 @@ def main() -> None:
                 args.pause_template, args.pause_glyph_confidence,
                 args.pause_score_margin,
             )
+            retry_button_target = None
+            if capacity_present and play_button_target is None:
+                trigger_hits = direct_hits or trigger_anchors(
+                    dets, triggers, args.min_score
+                )
+                retry_button_target = locate_retry_button(
+                    ocr, img, dets, trigger_hits, args.button,
+                    args.min_score, args.region, args.button_side,
+                )
+            retry_click_target = None
+            if retry_button_target is None or play_button_target is not None:
+                previous_retry_target = None
+                retry_stable_count = 0
+            else:
+                (
+                    previous_retry_target,
+                    retry_stable_count,
+                    retry_click_target,
+                ) = update_stable_retry_target(
+                    previous_retry_target,
+                    retry_stable_count,
+                    retry_button_target,
+                    args.stable_frames,
+                    args.stable_distance,
+                )
             now = time.monotonic()
             if now - last_heartbeat >= max(1.0, args.heartbeat):
                 if capacity_seen and play_button_target is not None:
@@ -700,8 +786,12 @@ def main() -> None:
                         if cooldown_left <= 0
                         else f"播放按钮(暂停状态)仍存在 | 冷却剩余 {cooldown_left:.0f}s"
                     )
+                elif capacity_present and retry_click_target is not None:
+                    state = "未检测到播放按钮, 容量提示旁重试按钮已稳定, 将点击重试"
+                elif capacity_present and retry_button_target is not None:
+                    state = "未检测到播放按钮, 等待重试按钮连续确认"
                 elif capacity_seen:
-                    state = "暂停按钮(运行中)或未检测到播放按钮, 不点击"
+                    state = "暂停按钮(运行中)或未检测到可点击按钮, 不点击"
                 else:
                     state = "等待容量提示"
                 log(f"监控仍在运行 | 状态: {state} | 扫描: {scan_count}")
@@ -715,7 +805,7 @@ def main() -> None:
                 time.sleep(args.interval)
                 continue
 
-            if play_button_target is None:
+            if play_button_target is None and retry_click_target is None:
                 time.sleep(args.interval)
                 continue
 
@@ -725,39 +815,64 @@ def main() -> None:
                 time.sleep(min(max(cooldown - elapsed, 0.1), max(args.interval, 0.1)))
                 continue
 
-            try:
-                target = click_play_button(
-                    args.restore_template,
-                    args.restore_confidence,
-                    args.region,
-                    args.restore_delay,
-                    args.interval,
-                    args.restore_timeout,
-                    args.stable_frames,
-                    args.stable_distance,
-                    args.play_glyph_confidence,
-                    args.pause_template,
-                    args.pause_glyph_confidence,
-                    args.pause_score_margin,
-                    dry_run=args.dry_run,
-                )
-            except Exception as exc:
-                log(f"播放按钮点击动作失败, 保持监控并重试: {exc}")
-                time.sleep(args.interval)
-                continue
-            if target is None:
-                # Keep monitoring; no click is made when template stabilization times out.
-                time.sleep(args.interval)
-                continue
+            if play_button_target is not None:
+                try:
+                    target = click_play_button(
+                        args.restore_template,
+                        args.restore_confidence,
+                        args.region,
+                        args.restore_delay,
+                        args.interval,
+                        args.restore_timeout,
+                        args.stable_frames,
+                        args.stable_distance,
+                        args.play_glyph_confidence,
+                        args.pause_template,
+                        args.pause_glyph_confidence,
+                        args.pause_score_margin,
+                        dry_run=args.dry_run,
+                    )
+                except Exception as exc:
+                    log(f"播放按钮点击动作失败, 保持监控并重试: {exc}")
+                    time.sleep(args.interval)
+                    continue
+                if target is None:
+                    # Keep monitoring; no click is made when template stabilization times out.
+                    time.sleep(args.interval)
+                    continue
 
-            clicks += 1
-            if args.dry_run:
-                log(f"检测到播放按钮, dry-run 未点击: ({target['x']:.0f},{target['y']:.0f})")
+                clicks += 1
+                if args.dry_run:
+                    log(f"检测到播放按钮, dry-run 未点击: ({target['x']:.0f},{target['y']:.0f})")
+                else:
+                    log(
+                        f"检测到播放按钮, 已点击: ({target['x']:.0f},{target['y']:.0f}) "
+                        f"| 图标分数={target.get('glyph_score', 0.0):.2f} -> 第 {clicks} 次点击"
+                    )
             else:
-                log(
-                    f"检测到播放按钮, 已点击: ({target['x']:.0f},{target['y']:.0f}) "
-                    f"| 图标分数={target.get('glyph_score', 0.0):.2f} -> 第 {clicks} 次点击"
-                )
+                # This branch is reached only while the capacity message is
+                # visible and no play icon was detected in the same frame.
+                try:
+                    if not args.dry_run:
+                        pyautogui.click(retry_click_target["x"], retry_click_target["y"])
+                        screen_w, screen_h = pyautogui.size()
+                        pyautogui.moveTo(max(1, screen_w - 20), max(1, screen_h - 20), duration=0)
+                except Exception as exc:
+                    log(f"重试按钮点击动作失败, 保持监控并重试: {exc}")
+                    time.sleep(args.interval)
+                    continue
+                clicks += 1
+                if args.dry_run:
+                    log(
+                        f"检测到重试按钮, dry-run 未点击: "
+                        f"({retry_click_target['x']:.0f},{retry_click_target['y']:.0f})"
+                    )
+                else:
+                    log(
+                        f"未检测到播放按钮, 已点击容量提示旁重试按钮: "
+                        f"({retry_click_target['x']:.0f},{retry_click_target['y']:.0f}) "
+                        f"-> 第 {clicks} 次点击"
+                    )
             last_click_time = time.monotonic()
             time.sleep(min(max(args.restore_transition_poll, 0.1), max(args.interval, 0.1)))
     except pyautogui.FailSafeException:

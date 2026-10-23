@@ -75,6 +75,9 @@ print(f"将点击: ({hit1['x']:.0f},{hit1['y']:.0f})  按钮真实中心=(654.5,
 assert abs(hit1["x"] - 654.5) < 40 and abs(hit1["y"] - 119.0) < 25, "FAIL[1]: 落点偏离"
 chosen1 = rw.choose_button(btns1, msgs1)
 assert chosen1 and abs(chosen1["x"] - 654.5) < 40, "FAIL[1]: 几何评分选错按钮"
+retry1 = rw.choose_retry_button(dets1, msgs1)
+assert retry1 and abs(retry1["x"] - 654.5) < 40, "FAIL[1]: 重试备用定位错误"
+assert rw.choose_retry_button(dets1, []) is None, "FAIL[1]: 无容量提示锚点不应选择重试"
 
 
 # ---- 用例 2: 提示被换行拆成两行(断点落在触发词中间) ----
@@ -96,6 +99,12 @@ assert rw.norm(TRIGGER) in joined2, "FAIL[2]: 跨行拼接匹配没生效"
 assert btns2, "FAIL[2]: 没识别到重试按钮"
 anchors2 = rw.trigger_anchors(dets2, [TRIGGER], 0.5)
 assert anchors2, "FAIL[2]: 换行提示没有生成位置锚点"
+retry2 = rw.choose_retry_button(dets2, anchors2)
+assert retry2, "FAIL[2]: 换行提示旁的重试按钮没有定位"
+prev, count, click = rw.update_stable_retry_target(None, 0, retry2)
+assert click is None and count == 1, "FAIL[2]: 重试按钮单帧不应点击"
+prev, count, click = rw.update_stable_retry_target(prev, count, retry2)
+assert click is retry2 and count == 2, "FAIL[2]: 重试按钮连续两帧后应允许点击"
 
 
 # ---- 用例 3: 用户实测布局——提示与重试同一行, 按钮在最右 ----

@@ -13,6 +13,8 @@ check, so a running target with a pause icon is not clicked.
 - Continuous screen monitoring with a configurable scan interval.
 - Clicks only after the capacity message has been detected.
 - Requires the play icon glyph to match and rejects the pause icon template.
+- If the capacity message is visible but no play icon is detected, clicks a
+  `重试` button only when OCR places it beside the capacity message.
 - Uses stable-position checks and a 10-second minimum interval between clicks.
 - Supports dry-run mode, bounded log rotation, screen regions, and a failsafe
   stop gesture.
