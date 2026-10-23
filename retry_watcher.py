@@ -922,8 +922,8 @@ def main() -> None:
                     help="暂停图标负匹配置信度, 默认 0.55")
     ap.add_argument("--pause-score-margin", type=float, default=0.05,
                     help="播放/暂停图标分数允许差值, 默认 0.05")
-    ap.add_argument("--restore-transition-poll", type=float, default=10.0,
-                    help="点击后检查播放/暂停状态的间隔(秒), 默认 10")
+    ap.add_argument("--restore-transition-poll", type=float, default=5.0,
+                    help="点击后检查播放/暂停状态的间隔(秒), 默认 5")
     ap.add_argument("--heartbeat", type=float, default=10.0,
                     help="后台运行心跳日志间隔(秒), 默认 10")
     ap.add_argument("--dry-run", action="store_true", help="只检测和打印, 不真正点击")
