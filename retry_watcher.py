@@ -13,6 +13,8 @@
 
 用法:
     python retry_watcher.py                      默认: 每 2s 扫描并持续监控
+    python retry_watcher.py --windows 2           左右两块区域独立监控
+    python retry_watcher.py --window-region 0,0,1000,1152 --window-region 1000,0,1048,1152
     python retry_watcher.py --dry-run            只检测和打印, 不真正点击
     python retry_watcher.py --interval 1 --restore-delay 1
     python retry_watcher.py --region 100,200,900,600          只扫屏幕某区域(更快)
@@ -20,7 +22,7 @@
     pythonw retry_watcher.py --log retry.log                  无窗口后台运行并记日志(默认 5 MB 自动轮换)
     python retry_watcher.py --stable-frames 3                 连续 3 帧确认后才点
 
-Codex 场景 (已适配, 也可直接双击 codex_retry.bat):
+Codex 场景 (已适配, 也可直接双击 codex_retry.bat; BAT 默认监控左右两个窗口):
     python retry_watcher.py --trigger "at capacity"
     * 只在容量提示出现后寻找播放按钮(当前暂停状态);
     * 播放按钮模板不匹配暂停按钮(当前运行状态), 因此运行中不会点击;
@@ -48,6 +50,7 @@ Codex 场景 (已适配, 也可直接双击 codex_retry.bat):
 
 import argparse
 import os
+import threading
 import time
 from datetime import datetime
 
@@ -67,26 +70,28 @@ DEFAULT_PAUSE_TEMPLATE = os.path.join(
 
 _LOG_FILE = None
 _LOG_MAX_BYTES = 5 * 1024 * 1024
+_LOG_LOCK = threading.Lock()
 
 
 def log(msg: str) -> None:
     line = f"[{datetime.now():%H:%M:%S}] {msg}"
-    print(line, flush=True)
-    if _LOG_FILE:
-        try:
-            encoded = (line + "\n").encode("utf-8")
-            if _LOG_MAX_BYTES > 0:
-                current_size = os.path.getsize(_LOG_FILE) if os.path.exists(_LOG_FILE) else 0
-                if current_size + len(encoded) > _LOG_MAX_BYTES:
-                    backup = _LOG_FILE + ".1"
-                    if os.path.exists(backup):
-                        os.remove(backup)
-                    if os.path.exists(_LOG_FILE):
-                        os.replace(_LOG_FILE, backup)
-            with open(_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(encoded.decode("utf-8"))
-        except OSError:
-            pass
+    with _LOG_LOCK:
+        print(line, flush=True)
+        if _LOG_FILE:
+            try:
+                encoded = (line + "\n").encode("utf-8")
+                if _LOG_MAX_BYTES > 0:
+                    current_size = os.path.getsize(_LOG_FILE) if os.path.exists(_LOG_FILE) else 0
+                    if current_size + len(encoded) > _LOG_MAX_BYTES:
+                        backup = _LOG_FILE + ".1"
+                        if os.path.exists(backup):
+                            os.remove(backup)
+                        if os.path.exists(_LOG_FILE):
+                            os.replace(_LOG_FILE, backup)
+                with open(_LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(encoded.decode("utf-8"))
+            except OSError:
+                pass
 
 
 def load_ocr():
@@ -644,6 +649,211 @@ def click_play_button(
     return target
 
 
+def split_monitor_regions(region, count):
+    """Split a screen or supplied region into equal vertical monitor areas."""
+    if count <= 1:
+        return [region]
+    if region is None:
+        screen_w, screen_h = pyautogui.size()
+        x, y, width, height = 0, 0, screen_w, screen_h
+    else:
+        x, y, width, height = region
+    regions = []
+    for index in range(count):
+        left = x + (width * index) // count
+        right = x + (width * (index + 1)) // count
+        regions.append((left, y, max(1, right - left), height))
+    return regions
+
+
+def monitor_region(region, args, triggers, trigger_norms, window_index, stop_event):
+    """Monitor one independent window region until the shared stop event is set."""
+    prefix = f"窗口{window_index}"
+
+    def wlog(message):
+        log(f"{prefix} | {message}")
+
+    try:
+        wlog("加载 OCR 模型(首次需要几秒)...")
+        ocr = load_ocr()
+    except Exception as exc:
+        wlog(f"OCR 初始化失败: {exc}")
+        stop_event.set()
+        return
+
+    wlog(
+        f"OCR 就绪 | 监控区域: {region or '全屏'} | 容量提示: {triggers} | "
+        f"播放模板: {args.restore_template} | 暂停负模板: {args.pause_template}"
+    )
+    if args.dry_run:
+        wlog("*** dry-run 模式: 只报告, 不点击 ***")
+
+    clicks = 0
+    capacity_seen = False
+    last_click_time = 0.0
+    previous_retry_target = None
+    retry_stable_count = 0
+    scan_count = 0
+    last_heartbeat = time.monotonic()
+
+    while not stop_event.is_set():
+        scan_count += 1
+        try:
+            shot = pyautogui.screenshot(region=region)
+        except pyautogui.FailSafeException:
+            wlog("failsafe 触发(鼠标在左上角), 已停止所有窗口监控")
+            stop_event.set()
+            return
+        except Exception as exc:
+            wlog(f"截图失败: {exc}")
+            stop_event.wait(max(0.1, args.interval))
+            continue
+
+        try:
+            img = to_bgr(shot)
+            dets = ocr_with_fallback(ocr, img, triggers)
+            direct_hits = find_hits(dets, triggers, args.min_score)
+            joined = joined_text(dets)
+            capacity_present = bool(direct_hits) or any(
+                keyword in joined for keyword in trigger_norms
+            )
+        except Exception as exc:
+            wlog(f"本轮 OCR 失败, 保持监控并重试: {exc}")
+            stop_event.wait(max(0.1, args.interval))
+            continue
+
+        play_button_target = locate_template_in_image(
+            args.restore_template, shot, args.restore_confidence, region,
+            args.play_glyph_confidence,
+            args.pause_template, args.pause_glyph_confidence,
+            args.pause_score_margin,
+        )
+        retry_button_target = None
+        if capacity_present and play_button_target is None:
+            trigger_hits = direct_hits or trigger_anchors(
+                dets, triggers, args.min_score
+            )
+            retry_button_target = locate_retry_button(
+                ocr, img, dets, trigger_hits, args.button,
+                args.min_score, region, args.button_side,
+            )
+        retry_click_target = None
+        if retry_button_target is None or play_button_target is not None:
+            previous_retry_target = None
+            retry_stable_count = 0
+        else:
+            (
+                previous_retry_target,
+                retry_stable_count,
+                retry_click_target,
+            ) = update_stable_retry_target(
+                previous_retry_target,
+                retry_stable_count,
+                retry_button_target,
+                args.stable_frames,
+                args.stable_distance,
+            )
+
+        now = time.monotonic()
+        if now - last_heartbeat >= max(1.0, args.heartbeat):
+            if capacity_seen and play_button_target is not None:
+                cooldown_left = max(0.0, args.restore_transition_poll - (now - last_click_time))
+                state = (
+                    f"播放按钮(暂停状态)已出现, 将点击 | 冷却剩余 {cooldown_left:.0f}s"
+                    if cooldown_left <= 0
+                    else f"播放按钮(暂停状态)仍存在 | 冷却剩余 {cooldown_left:.0f}s"
+                )
+            elif capacity_present and retry_click_target is not None:
+                state = "未检测到播放按钮, 容量提示旁重试按钮已稳定, 将点击重试"
+            elif capacity_present and retry_button_target is not None:
+                state = "未检测到播放按钮, 等待重试按钮连续确认"
+            elif capacity_seen:
+                state = "暂停按钮(运行中)或未检测到可点击按钮, 不点击"
+            else:
+                state = "等待容量提示"
+            wlog(f"监控仍在运行 | 状态: {state} | 扫描: {scan_count}")
+            last_heartbeat = now
+
+        if capacity_present and not capacity_seen:
+            capacity_seen = True
+            wlog("已检测到容量提示, 开始持续监控播放按钮")
+
+        if not capacity_seen or (play_button_target is None and retry_click_target is None):
+            stop_event.wait(max(0.1, args.interval))
+            continue
+
+        cooldown = max(0.0, args.restore_transition_poll)
+        elapsed = time.monotonic() - last_click_time
+        if elapsed < cooldown:
+            stop_event.wait(min(max(cooldown - elapsed, 0.1), max(args.interval, 0.1)))
+            continue
+
+        if play_button_target is not None:
+            try:
+                target = click_play_button(
+                    args.restore_template,
+                    args.restore_confidence,
+                    region,
+                    args.restore_delay,
+                    args.interval,
+                    args.restore_timeout,
+                    args.stable_frames,
+                    args.stable_distance,
+                    args.play_glyph_confidence,
+                    args.pause_template,
+                    args.pause_glyph_confidence,
+                    args.pause_score_margin,
+                    dry_run=args.dry_run,
+                )
+            except pyautogui.FailSafeException:
+                wlog("播放按钮触发 failsafe, 已停止所有窗口监控")
+                stop_event.set()
+                return
+            except Exception as exc:
+                wlog(f"播放按钮点击动作失败, 保持监控并重试: {exc}")
+                stop_event.wait(max(0.1, args.interval))
+                continue
+            if target is None:
+                stop_event.wait(max(0.1, args.interval))
+                continue
+            clicks += 1
+            if args.dry_run:
+                wlog(f"检测到播放按钮, dry-run 未点击: ({target['x']:.0f},{target['y']:.0f})")
+            else:
+                wlog(
+                    f"检测到播放按钮, 已点击: ({target['x']:.0f},{target['y']:.0f}) "
+                    f"| 图标分数={target.get('glyph_score', 0.0):.2f} -> 第 {clicks} 次点击"
+                )
+        else:
+            try:
+                if not args.dry_run:
+                    pyautogui.click(retry_click_target["x"], retry_click_target["y"])
+                    screen_w, screen_h = pyautogui.size()
+                    pyautogui.moveTo(max(1, screen_w - 20), max(1, screen_h - 20), duration=0)
+            except pyautogui.FailSafeException:
+                wlog("重试按钮触发 failsafe, 已停止所有窗口监控")
+                stop_event.set()
+                return
+            except Exception as exc:
+                wlog(f"重试按钮点击动作失败, 保持监控并重试: {exc}")
+                stop_event.wait(max(0.1, args.interval))
+                continue
+            clicks += 1
+            if args.dry_run:
+                wlog(
+                    f"检测到重试按钮, dry-run 未点击: "
+                    f"({retry_click_target['x']:.0f},{retry_click_target['y']:.0f})"
+                )
+            else:
+                wlog(
+                    f"未检测到播放按钮, 已点击容量提示旁重试按钮: "
+                    f"({retry_click_target['x']:.0f},{retry_click_target['y']:.0f}) "
+                    f"-> 第 {clicks} 次点击"
+                )
+        last_click_time = time.monotonic()
+        stop_event.wait(min(max(args.restore_transition_poll, 0.1), max(args.interval, 0.1)))
+
+
 def main() -> None:
     global _LOG_FILE, _LOG_MAX_BYTES
 
@@ -654,7 +864,11 @@ def main() -> None:
     ap.add_argument("--interval", type=float, default=2.0, help="扫描间隔(秒), 默认 2")
     ap.add_argument("--cooldown", type=float, default=0.0,
                     help="兼容旧参数, 现在不会暂停监控")
-    ap.add_argument("--region", type=parse_region, default=None, help="只监控屏幕区域 x,y,w,h")
+    ap.add_argument("--region", type=parse_region, default=None, help="兼容参数: 监控区域 x,y,w,h")
+    ap.add_argument("--window-region", dest="window_regions", type=parse_region,
+                    action="append", help="指定一个窗口区域; 可重复传入多个")
+    ap.add_argument("--windows", type=int, default=1,
+                    help="自动把屏幕或 --region 左右分成几个窗口区域, 默认 1")
     ap.add_argument("--trigger", default=DEFAULT_TRIGGER, help="触发提示文字, 逗号分隔多个")
     ap.add_argument("--button", default=DEFAULT_BUTTON, help=argparse.SUPPRESS)
     ap.add_argument("--no-msg-check", action="store_true", help=argparse.SUPPRESS)
@@ -695,6 +909,8 @@ def main() -> None:
                     help="日志文件上限(MB), 超过后轮换为 .1, 默认 5; 设为 0 表示不限")
     args = ap.parse_args()
 
+    if args.windows < 1:
+        ap.error("--windows 必须大于等于 1")
     _LOG_FILE = args.log
     _LOG_MAX_BYTES = max(0, int(args.log_max_mb * 1024 * 1024))
     triggers = [t.strip() for t in args.trigger.split(",") if t.strip()]
@@ -706,179 +922,36 @@ def main() -> None:
     if args.no_restore:
         log("忽略 --no-restore: 当前模式必须监控播放按钮")
 
-    log("加载 OCR 模型(首次需要几秒)...")
-    ocr = load_ocr()
+    regions = args.window_regions or split_monitor_regions(args.region, args.windows)
     log(
-        f"OCR 就绪 | 容量提示: {triggers} | 播放模板: {args.restore_template} "
-        f"| 暂停负模板: {args.pause_template}"
+        f"持续监控启动 | 窗口数: {len(regions)} | 区域: {regions} | 间隔: {args.interval}s | "
+        "播放按钮=暂停状态时点击, 暂停按钮=运行中时不点击"
     )
-    log(f"持续监控中... 间隔 {args.interval}s | 播放按钮=暂停状态时点击, 暂停按钮=运行中时不点击 | 无播放按钮但有容量提示旁重试按钮时点击重试 | 停止: 鼠标甩左上角或 Ctrl+C")
-    if args.dry_run:
-        log("*** dry-run 模式: 只报告, 不点击 ***")
+    if len(regions) > 1:
+        log("多窗口模式: 每个区域独立检测容量提示、按钮状态和点击冷却")
 
-    clicks = 0
-    capacity_seen = False
-    last_click_time = 0.0
-    previous_retry_target = None
-    retry_stable_count = 0
-    scan_count = 0
-    last_heartbeat = time.monotonic()
+    stop_event = threading.Event()
+    threads = []
+    for index, region in enumerate(regions, 1):
+        thread = threading.Thread(
+            target=monitor_region,
+            args=(region, args, triggers, trigger_norms, index, stop_event),
+            name=f"codex-auto-retry-window-{index}",
+            daemon=True,
+        )
+        thread.start()
+        threads.append(thread)
+
     try:
-        while True:
-            scan_count += 1
-            try:
-                shot = pyautogui.screenshot(region=args.region)
-            except Exception as exc:  # 截图偶发失败不退出
-                log(f"截图失败: {exc}")
-                time.sleep(args.interval)
-                continue
-
-            try:
-                img = to_bgr(shot)
-                dets = ocr_with_fallback(ocr, img, triggers)
-                direct_hits = find_hits(dets, triggers, args.min_score)
-                joined = joined_text(dets)
-                capacity_present = bool(direct_hits) or any(
-                    keyword in joined for keyword in trigger_norms
-                )
-            except Exception as exc:
-                log(f"本轮 OCR 失败, 保持监控并重试: {exc}")
-                time.sleep(args.interval)
-                continue
-
-            play_button_target = locate_template_in_image(
-                args.restore_template, shot, args.restore_confidence, args.region,
-                args.play_glyph_confidence,
-                args.pause_template, args.pause_glyph_confidence,
-                args.pause_score_margin,
-            )
-            retry_button_target = None
-            if capacity_present and play_button_target is None:
-                trigger_hits = direct_hits or trigger_anchors(
-                    dets, triggers, args.min_score
-                )
-                retry_button_target = locate_retry_button(
-                    ocr, img, dets, trigger_hits, args.button,
-                    args.min_score, args.region, args.button_side,
-                )
-            retry_click_target = None
-            if retry_button_target is None or play_button_target is not None:
-                previous_retry_target = None
-                retry_stable_count = 0
-            else:
-                (
-                    previous_retry_target,
-                    retry_stable_count,
-                    retry_click_target,
-                ) = update_stable_retry_target(
-                    previous_retry_target,
-                    retry_stable_count,
-                    retry_button_target,
-                    args.stable_frames,
-                    args.stable_distance,
-                )
-            now = time.monotonic()
-            if now - last_heartbeat >= max(1.0, args.heartbeat):
-                if capacity_seen and play_button_target is not None:
-                    cooldown_left = max(0.0, args.restore_transition_poll - (now - last_click_time))
-                    state = (
-                        f"播放按钮(暂停状态)已出现, 将点击 | 冷却剩余 {cooldown_left:.0f}s"
-                        if cooldown_left <= 0
-                        else f"播放按钮(暂停状态)仍存在 | 冷却剩余 {cooldown_left:.0f}s"
-                    )
-                elif capacity_present and retry_click_target is not None:
-                    state = "未检测到播放按钮, 容量提示旁重试按钮已稳定, 将点击重试"
-                elif capacity_present and retry_button_target is not None:
-                    state = "未检测到播放按钮, 等待重试按钮连续确认"
-                elif capacity_seen:
-                    state = "暂停按钮(运行中)或未检测到可点击按钮, 不点击"
-                else:
-                    state = "等待容量提示"
-                log(f"监控仍在运行 | 状态: {state} | 扫描: {scan_count}")
-                last_heartbeat = now
-
-            if capacity_present and not capacity_seen:
-                capacity_seen = True
-                log("已检测到容量提示, 开始持续监控播放按钮")
-
-            if not capacity_seen:
-                time.sleep(args.interval)
-                continue
-
-            if play_button_target is None and retry_click_target is None:
-                time.sleep(args.interval)
-                continue
-
-            cooldown = max(0.0, args.restore_transition_poll)
-            elapsed = time.monotonic() - last_click_time
-            if elapsed < cooldown:
-                time.sleep(min(max(cooldown - elapsed, 0.1), max(args.interval, 0.1)))
-                continue
-
-            if play_button_target is not None:
-                try:
-                    target = click_play_button(
-                        args.restore_template,
-                        args.restore_confidence,
-                        args.region,
-                        args.restore_delay,
-                        args.interval,
-                        args.restore_timeout,
-                        args.stable_frames,
-                        args.stable_distance,
-                        args.play_glyph_confidence,
-                        args.pause_template,
-                        args.pause_glyph_confidence,
-                        args.pause_score_margin,
-                        dry_run=args.dry_run,
-                    )
-                except Exception as exc:
-                    log(f"播放按钮点击动作失败, 保持监控并重试: {exc}")
-                    time.sleep(args.interval)
-                    continue
-                if target is None:
-                    # Keep monitoring; no click is made when template stabilization times out.
-                    time.sleep(args.interval)
-                    continue
-
-                clicks += 1
-                if args.dry_run:
-                    log(f"检测到播放按钮, dry-run 未点击: ({target['x']:.0f},{target['y']:.0f})")
-                else:
-                    log(
-                        f"检测到播放按钮, 已点击: ({target['x']:.0f},{target['y']:.0f}) "
-                        f"| 图标分数={target.get('glyph_score', 0.0):.2f} -> 第 {clicks} 次点击"
-                    )
-            else:
-                # This branch is reached only while the capacity message is
-                # visible and no play icon was detected in the same frame.
-                try:
-                    if not args.dry_run:
-                        pyautogui.click(retry_click_target["x"], retry_click_target["y"])
-                        screen_w, screen_h = pyautogui.size()
-                        pyautogui.moveTo(max(1, screen_w - 20), max(1, screen_h - 20), duration=0)
-                except Exception as exc:
-                    log(f"重试按钮点击动作失败, 保持监控并重试: {exc}")
-                    time.sleep(args.interval)
-                    continue
-                clicks += 1
-                if args.dry_run:
-                    log(
-                        f"检测到重试按钮, dry-run 未点击: "
-                        f"({retry_click_target['x']:.0f},{retry_click_target['y']:.0f})"
-                    )
-                else:
-                    log(
-                        f"未检测到播放按钮, 已点击容量提示旁重试按钮: "
-                        f"({retry_click_target['x']:.0f},{retry_click_target['y']:.0f}) "
-                        f"-> 第 {clicks} 次点击"
-                    )
-            last_click_time = time.monotonic()
-            time.sleep(min(max(args.restore_transition_poll, 0.1), max(args.interval, 0.1)))
-    except pyautogui.FailSafeException:
-        log("failsafe 触发(鼠标在左上角), 已停止")
+        while any(thread.is_alive() for thread in threads):
+            time.sleep(0.25)
     except KeyboardInterrupt:
-        log("Ctrl+C, 已停止")
+        log("Ctrl+C, 正在停止所有窗口监控")
+        stop_event.set()
+    finally:
+        stop_event.set()
+        for thread in threads:
+            thread.join(timeout=2.0)
 
 
 if __name__ == "__main__":

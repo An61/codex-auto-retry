@@ -105,6 +105,9 @@ prev, count, click = rw.update_stable_retry_target(None, 0, retry2)
 assert click is None and count == 1, "FAIL[2]: 重试按钮单帧不应点击"
 prev, count, click = rw.update_stable_retry_target(prev, count, retry2)
 assert click is retry2 and count == 2, "FAIL[2]: 重试按钮连续两帧后应允许点击"
+assert rw.split_monitor_regions((0, 0, 10, 4), 2) == [
+    (0, 0, 5, 4), (5, 0, 5, 4)
+], "FAIL[2]: 左右窗口区域切分错误"
 
 
 # ---- 用例 3: 用户实测布局——提示与重试同一行, 按钮在最右 ----

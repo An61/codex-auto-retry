@@ -1,6 +1,6 @@
 # codex-auto-retry
 
-`codex-auto-retry` monitors a Codex desktop screen for the capacity message
+`codex-auto-retry` monitors one or more side-by-side Codex desktop windows for the capacity message
 `Selected model is at capacity. Please try a different model.` and clicks the
 target's play icon when the target is paused.
 
@@ -11,6 +11,9 @@ check, so a running target with a pause icon is not clicked.
 ## Features
 
 - Continuous screen monitoring with a configurable scan interval.
+- The bundled BAT starts two independent left/right window monitors.
+- Each window keeps its own capacity latch, button state, retry stability count,
+  and click cooldown.
 - Clicks only after the capacity message has been detected.
 - Requires the play icon glyph to match and rejects the pause icon template.
 - If the capacity message is visible but no play icon is detected, clicks a
@@ -39,6 +42,11 @@ For the bundled Windows launcher:
 ```text
 codex_retry.bat
 ```
+
+The launcher splits the current screen into two equal vertical regions. To
+monitor one full-screen Codex window instead, pass `--windows 1`. For custom
+window positions, pass `--window-region x,y,w,h` once per window; this replaces
+the automatic split.
 
 If Python is installed in a custom environment, create a local
 `codex_retry.local.bat` next to the launcher. This file is ignored by Git:
