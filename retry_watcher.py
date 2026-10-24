@@ -49,6 +49,8 @@ Codex 场景 (已适配, 也可直接双击 codex_retry.bat; BAT 默认监控左
 """
 
 import argparse
+import ctypes
+from ctypes import wintypes
 import os
 import threading
 import time
@@ -690,6 +692,37 @@ def split_monitor_regions(region, count):
     return regions
 
 
+def detect_codex_regions(max_windows=4):
+    """Return visible top-level Codex window rectangles on Windows."""
+    if os.name != "nt":
+        return []
+    user32 = ctypes.windll.user32
+    regions = []
+    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    @callback_type
+    def callback(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        title = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title, length + 1)
+        if not any(token in title.value.lower() for token in ("codex", "chatgpt")):
+            return True
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return True
+        width, height = rect.right - rect.left, rect.bottom - rect.top
+        if width > 200 and height > 200:
+            regions.append((rect.left, rect.top, width, height))
+        return True
+
+    user32.EnumWindows(callback, 0)
+    return sorted(set(regions), key=lambda item: (item[1], item[0]))[:max_windows]
+
+
 def monitor_region(region, args, triggers, trigger_norms, window_index, stop_event):
     """Monitor one independent window region until the shared stop event is set."""
     prefix = f"窗口{window_index}"
@@ -890,8 +923,8 @@ def main() -> None:
     ap.add_argument("--region", type=parse_region, default=None, help="兼容参数: 监控区域 x,y,w,h")
     ap.add_argument("--window-region", dest="window_regions", type=parse_region,
                     action="append", help="指定一个窗口区域; 可重复传入多个")
-    ap.add_argument("--windows", type=int, default=1,
-                    help="没有显式区域时把屏幕左右分成几个窗口区域, 默认 1")
+    ap.add_argument("--windows", default="1",
+                    help="窗口数量: 1-4 或 auto 自动识别, 默认 1")
     ap.add_argument("--trigger", default=DEFAULT_TRIGGER, help="触发提示文字, 逗号分隔多个")
     ap.add_argument("--button", default=DEFAULT_BUTTON, help=argparse.SUPPRESS)
     ap.add_argument("--no-msg-check", action="store_true", help=argparse.SUPPRESS)
@@ -932,8 +965,15 @@ def main() -> None:
                     help="日志文件上限(MB), 超过后轮换为 .1, 默认 5; 设为 0 表示不限")
     args = ap.parse_args()
 
-    if args.windows < 1:
-        ap.error("--windows 必须大于等于 1")
+    if args.windows == "auto":
+        window_count = None
+    else:
+        try:
+            window_count = int(args.windows)
+        except ValueError:
+            ap.error("--windows 必须是 auto 或 1-4")
+        if window_count < 1 or window_count > 4:
+            ap.error("--windows 必须是 auto 或 1-4")
     _LOG_FILE = args.log
     _LOG_MAX_BYTES = max(0, int(args.log_max_mb * 1024 * 1024))
     triggers = [t.strip() for t in args.trigger.split(",") if t.strip()]
@@ -949,8 +989,12 @@ def main() -> None:
         regions = args.window_regions
     elif args.region is not None:
         regions = [args.region]
+    elif window_count is None:
+        regions = detect_codex_regions(4) or [None]
     else:
-        regions = split_monitor_regions(None, args.windows)
+        regions = split_monitor_regions(None, window_count)
+    if len(regions) > 4:
+        regions = regions[:4]
     log(
         f"持续监控启动 | 窗口数: {len(regions)} | 区域: {regions} | 间隔: {args.interval}s | "
         "播放按钮=暂停状态时点击, 暂停按钮=运行中时不点击"

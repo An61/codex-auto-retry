@@ -11,7 +11,7 @@ check, so a running target with a pause icon is not clicked.
 ## Features
 
 - Continuous screen monitoring with a configurable scan interval.
-- The bundled BAT starts two independent left/right window monitors.
+- The bundled BAT auto-detects 1-4 visible Codex windows and monitors each independently.
 - Each window keeps its own capacity latch, button state, retry stability count,
   and click cooldown.
 - Clicks only after the capacity message has been detected.
@@ -43,11 +43,11 @@ For the bundled Windows launcher:
 codex_retry.bat
 ```
 
-The launcher splits the current screen into two equal vertical regions. To
-monitor one full-screen Codex window instead, pass `--windows 1`. The legacy
+The launcher detects visible Codex window rectangles through the Windows window
+list. To force a fixed count, pass `--windows 1` through `--windows 4`. The legacy
 `--region x,y,w,h` option always monitors one explicit region. For custom
 multiple window positions, pass `--window-region x,y,w,h` once per window; this
-replaces the automatic split.
+replaces automatic detection.
 
 If Python is installed in a custom environment, create a local
 `codex_retry.local.bat` next to the launcher. This file is ignored by Git:
